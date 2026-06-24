@@ -264,7 +264,7 @@ Positive signals: {row.get("positive_signals", "")}
 
 # ── Web UI ────────────────────────────────────────────────────────────────────
 
-LOGIN_HTML = """
+LOGIN_HTML = r"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -304,7 +304,7 @@ LOGIN_HTML = """
 </html>
 """
 
-APP_HTML = """
+APP_HTML = r"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -492,17 +492,20 @@ APP_HTML = """
 
     // Simple markdown renderer
     function marked(text) {
-      return text
-        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-        .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-        .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-        .replace(/^---$/gm, '<hr>')
-        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-        .replace(/^\* (.+)$/gm, '<li>$1</li>')
-        .replace(/^- (.+)$/gm, '<li>$1</li>')
-        .replace(/(<li>.*<\/li>\n?)+/g, m => '<ul>' + m + '</ul>')
-        .replace(/\n\n/g, '<br><br>')
-        .replace(/\n/g, '<br>');
+      var t = text
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      t = t.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+      t = t.replace(/^## (.+)$/gm, '<h2>$2</h2>');
+      t = t.replace(/^---$/gm, '<hr>');
+      t = t.replace(/[*][*](.+?)[*][*]/g, '<strong>$1</strong>');
+      t = t.replace(/^[*] (.+)$/gm, '<li>$1</li>');
+      t = t.replace(/^- (.+)$/gm, '<li>$1</li>');
+      t = t.split('<li>').join('\x00LI\x00').split('</li>').join('\x00/LI\x00');
+      t = t.replace(/\x00LI\x00(.*?)\x00\/LI\x00/g, '<li>$1</li>');
+      t = t.replace(/(<li>.*?<\/li>)/g, '<ul>$1</ul>');
+      t = t.replace(/\\n\\n/g, '<br><br>');
+      t = t.replace(/\\n/g, '<br>');
+      return t;
     }
   </script>
 </body>
