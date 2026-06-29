@@ -46,7 +46,8 @@ with open(PROMPT_PATH, "r") as f:
 QUERY_SYSTEM_PROMPT = """You are an analyst for Pivotree, a B2B commerce services company.
 You have access to structured extractions from customer and prospect call transcripts.
 Each record includes call type, customer name, date, and extracted fields covering
-concerns, objections, product gaps, feature requests, risks, and key quotes.
+sales objections, service gaps, proposal feedback, delivery risks, churn signals,
+and competitor mentions.
 
 When answering questions:
 - Be direct and specific. Lead with the answer.
@@ -144,20 +145,15 @@ def write_to_sheets(sheets_service, call_id: str, extraction: dict):
         extraction.get("call_duration_minutes", ""),
         arr_to_str(extraction.get("participants_pivotree", [])),
         arr_to_str(extraction.get("participants_customer", [])),
-        arr_to_str(extraction.get("customer_concerns", [])),
-        arr_to_str(extraction.get("objections", [])),
-        arr_to_str(extraction.get("feature_requests", [])),
-        arr_to_str(extraction.get("product_gaps", [])),
+        arr_to_str(extraction.get("sales_objections", [])),
+        arr_to_str(extraction.get("service_gaps", [])),
         arr_to_str(extraction.get("proposal_feedback", [])),
-        arr_to_str(extraction.get("implementation_risks", [])),
-        arr_to_str(extraction.get("timeline_risks", [])),
-        arr_to_str(extraction.get("resource_constraints", [])),
+        arr_to_str(extraction.get("delivery_risks", [])),
+        arr_to_str(extraction.get("churn_signals", [])),
         arr_to_str(extraction.get("competitor_mentions", [])),
-        arr_to_str(extraction.get("buying_signals", [])),
-        arr_to_str(extraction.get("positive_signals", [])),
         extraction.get("_source_file", ""),
         now,
-        extraction.get("schema_version", "v3"),
+        extraction.get("schema_version", "v4"),
     ]]
 
     sheets_service.spreadsheets().values().append(
@@ -247,17 +243,12 @@ Call: {cid}
 Customer: {row.get("customer_name", "")}
 Date: {row.get("call_date", "")}
 Type: {row.get("call_type", "")}
-Customer concerns: {row.get("customer_concerns", "")}
-Objections: {row.get("objections", "")}
-Feature requests: {row.get("feature_requests", "")}
-Product gaps: {row.get("product_gaps", "")}
+Sales objections: {row.get("sales_objections", "")}
+Service gaps: {row.get("service_gaps", "")}
 Proposal feedback: {row.get("proposal_feedback", "")}
-Implementation risks: {row.get("implementation_risks", "")}
-Timeline risks: {row.get("timeline_risks", "")}
-Resource constraints: {row.get("resource_constraints", "")}
+Delivery risks: {row.get("delivery_risks", "")}
+Churn signals: {row.get("churn_signals", "")}
 Competitor mentions: {row.get("competitor_mentions", "")}
-Buying signals: {row.get("buying_signals", "")}
-Positive signals: {row.get("positive_signals", "")}
 {quote_lines}""")
     return "\n".join(blocks)
 
@@ -367,20 +358,17 @@ APP_HTML = r"""
     <h1>Transcript Intelligence</h1>
     <div style="display:flex;gap:20px;align-items:center">
       <span id="record-count">Loading...</span>
-      <button id="backfill-btn" onclick="runBackfill()" style="padding:7px 14px;font-size:13px;background:#2a2d3a;border:1px solid #3a3d4a;border-radius:6px;color:#aaa;cursor:pointer;">Run Backfill</button>
       <a href="/logout" class="logout">Sign out</a>
     </div>
   </div>
-  <div id="backfill-status" style="display:none;background:#1a1d27;border-bottom:1px solid #2a2d3a;padding:12px 32px;font-size:13px;color:#aaa;"></div>
   <div class="main">
     <div class="suggestions">
-      <div class="chip" onclick="setQ('What product gaps are showing up repeatedly?')">Product gaps</div>
-      <div class="chip" onclick="setQ('What are the biggest customer complaints?')">Top complaints</div>
-      <div class="chip" onclick="setQ('What are the most common objections in sales calls?')">Sales objections</div>
-      <div class="chip" onclick="setQ('What are customers asking for that we don\\'t have?')">Feature requests</div>
-      <div class="chip" onclick="setQ('What are the biggest implementation risks right now?')">Implementation risks</div>
-      <div class="chip" onclick="setQ('What are customers saying about competitors?')">Competitor mentions</div>
+      <div class="chip" onclick="setQ('What service gaps are showing up repeatedly?')">Service gaps</div>
+      <div class="chip" onclick="setQ('What are the biggest churn signals across all calls?')">Churn signals</div>
+      <div class="chip" onclick="setQ('What are the most common sales objections?')">Sales objections</div>
+      <div class="chip" onclick="setQ('What delivery or project management problems keep coming up?')">Delivery risks</div>
       <div class="chip" onclick="setQ('What feedback are customers giving on our proposals or SOWs?')">Proposal feedback</div>
+      <div class="chip" onclick="setQ('What are customers saying about competitors?')">Competitor mentions</div>
     </div>
     <div class="filter">
       <label>Filter by call type:</label>
@@ -402,7 +390,6 @@ APP_HTML = r"""
   </div>
 
   <script>
-    // Load record count on page load
     fetch('/stats').then(r=>r.json()).then(d=>{
       document.getElementById('record-count').textContent = d.total_calls + ' calls';
     }).catch(()=>{
@@ -454,57 +441,18 @@ APP_HTML = r"""
       });
     }
 
-    function runBackfill() {
-      const btn = document.getElementById('backfill-btn');
-      const status = document.getElementById('backfill-status');
-      if (!confirm('Run backfill? This will process all unprocessed transcripts in the Drive folder. It may take several minutes.')) return;
-      btn.disabled = true;
-      btn.textContent = 'Running...';
-      status.style.display = 'block';
-      status.textContent = 'Backfill started — this runs in the background. Check your Google Sheet ProcessingLog for progress.';
-      fetch('/backfill', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json', 'X-App-Auth': 'true'},
-        body: JSON.stringify({})
-      })
-      .then(r => r.json())
-      .then(d => {
-        if (d.error) {
-          status.textContent = 'Error: ' + d.error;
-          status.style.color = '#ff6b6b';
-        } else {
-          status.textContent = 'Backfill complete: ' + d.succeeded + ' succeeded, ' + d.failed + ' failed, ' + d.already_processed + ' already done.';
-          status.style.color = '#5b6af0';
-          fetch('/stats').then(r=>r.json()).then(d=>{
-            document.getElementById('record-count').textContent = d.total_calls + ' calls';
-          });
-        }
-      })
-      .catch(e => {
-        status.textContent = 'Error: ' + e.message;
-        status.style.color = '#ff6b6b';
-      })
-      .finally(() => {
-        btn.disabled = false;
-        btn.textContent = 'Run Backfill';
-      });
-    }
-
-    // Simple markdown renderer
     function marked(text) {
       var t = text
         .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
       t = t.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-      t = t.replace(/^## (.+)$/gm, '<h2>$2</h2>');
+      t = t.replace(/^## (.+)$/gm, '<h2>$1</h2>');
       t = t.replace(/^---$/gm, '<hr>');
-      t = t.replace(/[*][*](.+?)[*][*]/g, '<strong>$1</strong>');
-      t = t.replace(/^[*] (.+)$/gm, '<li>$1</li>');
+      t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      t = t.replace(/^\* (.+)$/gm, '<li>$1</li>');
       t = t.replace(/^- (.+)$/gm, '<li>$1</li>');
-      t = t.split('<li>').join('\x00LI\x00').split('</li>').join('\x00/LI\x00');
-      t = t.replace(/\x00LI\x00(.*?)\x00\/LI\x00/g, '<li>$1</li>');
-      t = t.replace(/(<li>.*?<\/li>)/g, '<ul>$1</ul>');
-      t = t.replace(/\\n\\n/g, '<br><br>');
-      t = t.replace(/\\n/g, '<br>');
+      t = t.replace(/(<li>[\s\S]*?<\/li>)/g, '<ul>$1</ul>');
+      t = t.replace(/\n\n/g, '<br><br>');
+      t = t.replace(/\n/g, '<br>');
       return t;
     }
   </script>
@@ -638,89 +586,6 @@ def process_transcript():
         except Exception:
             pass
         return jsonify({"status": "error", "call_id": call_id, "error": str(e)}), 500
-
-
-@app.route("/backfill", methods=["POST"])
-@login_required
-def backfill():
-    """
-    Reads all .txt files from the configured Drive folder,
-    skips any already in ProcessingLog, processes the rest.
-    Call once to bulk-process existing transcripts.
-    POST /backfill with X-API-Secret header.
-    Optional body: {"limit": 50} to process in batches.
-    """
-    data = request.get_json() or {}
-    limit = int(data.get("limit", 9999))
-    folder_id = data.get("folder_id", DRIVE_FOLDER_ID)
-
-    if not folder_id:
-        return jsonify({"error": "folder_id required. Set DRIVE_FOLDER_ID env var or pass in body."}), 400
-
-    try:
-        drive, sheets = get_services()
-
-        # Get already-processed call IDs from ProcessingLog
-        log_rows = read_sheet(sheets, SHEET_TAB_LOG)
-        processed_ids = {r.get("call_id", "") for r in log_rows}
-
-        # List all files in the folder
-        results = drive.files().list(
-            q=f"'{folder_id}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
-            fields="files(id, name, mimeType)",
-            pageSize=1000
-        ).execute()
-
-        all_files = results.get("files", [])
-
-        # Filter to only unprocessed files
-        to_process = [
-            f for f in all_files
-            if Path(f["name"]).stem not in processed_ids
-        ][:limit]
-
-        total = len(all_files)
-        skipped = total - len(to_process) - (total - len([f for f in all_files if Path(f["name"]).stem not in processed_ids]))
-        already_done = total - len([f for f in all_files if Path(f["name"]).stem not in processed_ids])
-
-        results_summary = {
-            "total_in_folder": total,
-            "already_processed": already_done,
-            "to_process": len(to_process),
-            "succeeded": 0,
-            "failed": 0,
-            "errors": []
-        }
-
-        for f in to_process:
-            file_id = f["id"]
-            file_name = f["name"]
-            call_id = Path(file_name).stem
-
-            try:
-                transcript_text = download_file_text(drive, file_id)
-
-                if len(transcript_text.strip()) < 200:
-                    write_error_log(sheets, call_id, file_name, "too short")
-                    results_summary["failed"] += 1
-                    continue
-
-                extraction = extract_transcript(transcript_text, file_name)
-                write_to_sheets(sheets, call_id, extraction)
-                results_summary["succeeded"] += 1
-
-            except Exception as e:
-                try:
-                    write_error_log(sheets, call_id, file_name, str(e))
-                except Exception:
-                    pass
-                results_summary["failed"] += 1
-                results_summary["errors"].append({"file": file_name, "error": str(e)[:200]})
-
-        return jsonify(results_summary), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
