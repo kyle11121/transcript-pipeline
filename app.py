@@ -1,3 +1,6 @@
+Two changes, both surgical. Here's the full file:
+
+```python
 """
 Transcript Intelligence - Full Service
 ----------------------------------------
@@ -525,12 +528,22 @@ APP_HTML = r"""
         } else {
           const debug = d.debug || {};
           const debugLine = debug.records_loaded
-            ? `${debug.records_used} of ${debug.records_loaded} calls used · `
+            ? `${debug.records_used} of ${debug.records_loaded} calls · `
               + `${debug.distinct_customers_used} customers · `
+              + `types: ${(debug.call_types_used || []).join(', ') || 'all'} · `
               + `fields: ${(debug.fields_used || []).join(', ')}`
             : d.records_searched + ' calls searched';
-          result.innerHTML = '<div class="answer">' + marked(d.answer) +
-            '<div class="meta">' + debugLine + '</div></div>';
+
+          const topCalls = (debug.top_calls || []).map(c =>
+            `${c.customer} · ${c.call_date} · score: ${c.score}`
+          ).join('<br>');
+
+          result.innerHTML =
+            '<div class="answer">' +
+            marked(d.answer) +
+            '<div class="meta">' + debugLine +
+            (topCalls ? '<br><br><span style="color:#444">Top retrieved:</span><br>' + topCalls : '') +
+            '</div></div>';
         }
       })
       .catch(e => {
@@ -656,6 +669,16 @@ def ask():
         context = build_context(top_rows, quotes, fields)
         distinct_customers = len({r.get("customer_name", "") for r in top_rows if r.get("customer_name")})
 
+        # Top 10 calls for debug
+        top_calls_debug = [
+            {
+                "customer": r.get("customer_name", "unknown"),
+                "call_date": r.get("call_date", ""),
+                "score": round(score_row(r, fields, keywords), 1)
+            }
+            for r in top_rows[:10]
+        ]
+
         # Stage 2: synthesize
         message = anthropic_client.messages.create(
             model=MODEL_QUERY,
@@ -684,6 +707,7 @@ def ask():
                 "call_types_used": call_types,
                 "keywords_used": keywords,
                 "distinct_customers_used": distinct_customers,
+                "top_calls": top_calls_debug,
             }
         }), 200
 
@@ -735,3 +759,6 @@ def process_transcript():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+```
+
+Push and deploy.
