@@ -503,7 +503,7 @@ APP_HTML = r"""
   </div>
   <div class="main">
     <div class="suggestions">
-      <div class="chip" onclick="setQ('What service gaps are showing up repeatedly?')">Service gaps</div>
+      <div class="chip" onclick="setQ('What customer pain points are showing up repeatedly?')">Customer pain points</div>
       <div class="chip" onclick="setQ('What are the biggest churn signals across all calls?')">Churn signals</div>
       <div class="chip" onclick="setQ('What are the most common sales objections?')">Sales objections</div>
       <div class="chip" onclick="setQ('What delivery or project management problems keep coming up?')">Delivery risks</div>
