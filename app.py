@@ -45,13 +45,13 @@ with open(PROMPT_PATH, "r") as f:
 
 QUERY_SYSTEM_PROMPT = """You are an analyst for Pivotree, a B2B commerce services company.
 You have access to structured extractions from customer and prospect call transcripts.
-Each record includes call type, customer name, date, and extracted fields covering
-sales objections, service gaps, proposal feedback, delivery risks, churn signals,
-and competitor mentions.
 
 When answering questions:
 - Be direct and specific. Lead with the answer.
-- Rank or group findings by frequency and severity when relevant.
+- COUNT distinct customers first, then call frequency second.
+- Do not let one customer with many calls dominate the answer.
+- Always report how many distinct customers mentioned each pattern.
+- Rank findings by frequency across customers, not volume of quotes from one account.
 - Always cite the specific customer and call where evidence comes from.
 - Include verbatim quotes when they exist and are relevant.
 - Separate findings by call type when the question benefits from it.
@@ -59,12 +59,40 @@ When answering questions:
 - Format your response with clear headers and bullets. Keep it tight.
 - Never fabricate evidence. Only use what's in the records provided."""
 
-# ── Clients ───────────────────────────────────────────────────────────────────
+INTENT_SYSTEM_PROMPT = """You are a query classifier for a B2B call transcript intelligence system.
 
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+Given a user question, return a JSON object with:
+- "fields": list of relevant schema fields to search. Choose from:
+    sales_objections, service_gaps, proposal_feedback, delivery_risks,
+    churn_signals, competitor_mentions, key_quotes
+- "call_types": list of relevant call types to filter on. Choose from:
+    sales_discovery, sales_followup, delivery, renewal, escalation, qbr, internal, unknown
+    Use empty list [] if all call types are relevant.
+- "keywords": list of 3-8 keywords or short phrases likely to appear in relevant records.
+    Think semantically — include synonyms and related terms.
+    Example: for "pricing objections" include ["price", "cost", "budget", "expensive", "too high", "pricing", "commercial"]
+
+Return ONLY valid JSON. No preamble, no explanation, no markdown.
+
+Example output:
+{
+  "fields": ["sales_objections", "proposal_feedback"],
+  "call_types": ["sales_discovery", "sales_followup", "renewal"],
+  "keywords": ["price", "cost", "budget", "expensive", "too high", "value", "ROI"]
+}"""
+
+# ── Cached Google clients ─────────────────────────────────────────────────────
+
+_drive_service = None
+_sheets_service = None
 
 
 def get_services():
+    global _drive_service, _sheets_service
+
+    if _drive_service and _sheets_service:
+        return _drive_service, _sheets_service
+
     creds_dict = json.loads(GOOGLE_CREDS_JSON)
     creds = service_account.Credentials.from_service_account_info(
         creds_dict,
@@ -73,9 +101,16 @@ def get_services():
             "https://www.googleapis.com/auth/spreadsheets"
         ]
     )
-    drive  = build("drive",  "v3", credentials=creds)
-    sheets = build("sheets", "v4", credentials=creds)
-    return drive, sheets
+
+    _drive_service = build("drive", "v3", credentials=creds)
+    _sheets_service = build("sheets", "v4", credentials=creds)
+
+    return _drive_service, _sheets_service
+
+
+# ── Anthropic client ──────────────────────────────────────────────────────────
+
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -219,7 +254,54 @@ def read_sheet(sheets_service, tab):
     return [dict(zip(headers, row + [""] * (len(headers) - len(row)))) for row in rows[1:]]
 
 
-def build_context(insights, quotes):
+def classify_intent(question: str) -> dict:
+    try:
+        message = anthropic_client.messages.create(
+            model=MODEL_EXTRACT,
+            max_tokens=512,
+            system=INTENT_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": question}]
+        )
+        raw = message.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        return json.loads(raw)
+    except Exception:
+        return {
+            "fields": ["sales_objections", "service_gaps", "proposal_feedback",
+                       "delivery_risks", "churn_signals", "competitor_mentions"],
+            "call_types": [],
+            "keywords": []
+        }
+
+
+def score_row(row: dict, fields: list, keywords: list) -> float:
+    score = 0.0
+
+    for field in fields:
+        val = row.get(field, "")
+        if val and val.strip():
+            score += 2.0
+
+    searchable = " ".join([
+        row.get(f, "") for f in fields
+    ] + [
+        row.get("customer_name", ""),
+        row.get("call_type", ""),
+    ]).lower()
+
+    for kw in keywords:
+        if kw.lower() in searchable:
+            score += 1.0
+
+    return score
+
+
+def build_context(insights: list, quotes: list, fields: list = None) -> str:
+    if fields is None:
+        fields = ["sales_objections", "service_gaps", "proposal_feedback",
+                  "delivery_risks", "churn_signals", "competitor_mentions"]
+
     quote_map = {}
     for q in quotes:
         cid = q.get("call_id", "")
@@ -231,25 +313,38 @@ def build_context(insights, quotes):
     for row in insights:
         cid = row.get("call_id", "")
         call_quotes = quote_map.get(cid, [])
-        quote_lines = ""
-        if call_quotes:
-            quote_lines = "\n  Key quotes:\n" + "\n".join(
-                f'    [{q.get("category","")} | {q.get("speaker_role","")} | {q.get("timestamp","")}] '
-                f'"{q.get("quote_text","")}"'
-                for q in call_quotes
+
+        relevant_quotes = [
+            q for q in call_quotes
+            if any(
+                kw in q.get("category", "").lower()
+                for f in fields
+                for kw in f.replace("_", " ").split() + [f.replace("_", " ")]
             )
+        ] or call_quotes[:2]
+
+        quote_lines = ""
+        if relevant_quotes:
+            quote_lines = "\n  Key quotes:\n" + "\n".join(
+                f'    [{q.get("category", "")} | {q.get("speaker_role", "")} | {q.get("timestamp", "")}] '
+                f'"{q.get("quote_text", "") or q.get("text", "")}"'
+                for q in relevant_quotes
+            )
+
+        field_lines = "\n".join([
+            f"{field}: {row.get(field, '')}"
+            for field in fields
+            if row.get(field, "").strip()
+        ])
+
         blocks.append(f"""---
 Call: {cid}
 Customer: {row.get("customer_name", "")}
 Date: {row.get("call_date", "")}
 Type: {row.get("call_type", "")}
-Sales objections: {row.get("sales_objections", "")}
-Service gaps: {row.get("service_gaps", "")}
-Proposal feedback: {row.get("proposal_feedback", "")}
-Delivery risks: {row.get("delivery_risks", "")}
-Churn signals: {row.get("churn_signals", "")}
-Competitor mentions: {row.get("competitor_mentions", "")}
+{field_lines}
 {quote_lines}""")
+
     return "\n".join(blocks)
 
 
@@ -428,8 +523,14 @@ APP_HTML = r"""
         if (d.error) {
           result.innerHTML = '<div class="answer" style="color:#ff6b6b">' + d.error + '</div>';
         } else {
+          const debug = d.debug || {};
+          const debugLine = debug.records_loaded
+            ? `${debug.records_used} of ${debug.records_loaded} calls used · `
+              + `${debug.distinct_customers_used} customers · `
+              + `fields: ${(debug.fields_used || []).join(', ')}`
+            : d.records_searched + ' calls searched';
           result.innerHTML = '<div class="answer">' + marked(d.answer) +
-            '<div class="meta">' + d.records_searched + ' calls searched</div></div>';
+            '<div class="meta">' + debugLine + '</div></div>';
         }
       })
       .catch(e => {
@@ -447,7 +548,7 @@ APP_HTML = r"""
       t = t.replace(/^### (.+)$/gm, '<h3>$1</h3>');
       t = t.replace(/^## (.+)$/gm, '<h2>$1</h2>');
       t = t.replace(/^---$/gm, '<hr>');
-      t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      t = t.replace(/[*][*](.+?)[*][*]/g, '<strong>$1</strong>');
       t = t.replace(/^\* (.+)$/gm, '<li>$1</li>');
       t = t.replace(/^- (.+)$/gm, '<li>$1</li>');
       t = t.replace(/(<li>[\s\S]*?<\/li>)/g, '<ul>$1</ul>');
@@ -508,39 +609,82 @@ def ask():
     data = request.get_json()
     question = data.get("question", "").strip()
     call_type_filter = data.get("call_type")
+    top_n = int(data.get("top_n", 75))
 
     if not question:
         return jsonify({"error": "No question provided"}), 400
 
     try:
         _, sheets = get_services()
-        insights = read_sheet(sheets, SHEET_TAB_INSIGHTS)
 
+        # Stage 1: classify intent
+        intent = classify_intent(question)
+        fields     = intent.get("fields", [])
+        call_types = intent.get("call_types", [])
+        keywords   = intent.get("keywords", [])
+
+        # Manual call type override
         if call_type_filter:
-            insights = [r for r in insights if r.get("call_type", "").lower() == call_type_filter.lower()]
+            call_types = [call_type_filter]
 
-        if not insights:
-            return jsonify({"error": "No records found."}), 200
+        # Load insights
+        insights = read_sheet(sheets, SHEET_TAB_INSIGHTS)
+        total_loaded = len(insights)
 
-        call_ids = {r.get("call_id") for r in insights}
+        # Filter by call type
+        if call_types:
+            insights = [
+                r for r in insights
+                if r.get("call_type", "").lower() in [ct.lower() for ct in call_types]
+            ]
+
+        # Score and rank
+        scored = [(score_row(r, fields, keywords), r) for r in insights]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        scored = [(s, r) for s, r in scored if s > 0]
+        top_rows = [r for _, r in scored[:top_n]]
+
+        # Fallback if scoring returns nothing
+        if not top_rows:
+            top_rows = insights[:top_n]
+
+        # Load quotes for selected calls only
+        call_ids = {r.get("call_id") for r in top_rows}
         quotes = read_sheet(sheets, SHEET_TAB_QUOTES)
         quotes = [q for q in quotes if q.get("call_id") in call_ids]
 
-        context = build_context(insights, quotes)
+        context = build_context(top_rows, quotes, fields)
+        distinct_customers = len({r.get("customer_name", "") for r in top_rows if r.get("customer_name")})
 
+        # Stage 2: synthesize
         message = anthropic_client.messages.create(
             model=MODEL_QUERY,
             max_tokens=4096,
             system=QUERY_SYSTEM_PROMPT,
             messages=[{
                 "role": "user",
-                "content": f"Here is the extracted intelligence from {len(insights)} calls:\n\n{context}\n\n---\n\nQuestion: {question}"
+                "content": (
+                    f"Here is extracted intelligence from {len(top_rows)} calls "
+                    f"across {distinct_customers} distinct customers:\n\n"
+                    f"{context}\n\n---\n\n"
+                    f"Question: {question}\n\n"
+                    f"Remember: count patterns by distinct customers first, "
+                    f"call frequency second. Do not let one customer dominate."
+                )
             }]
         )
 
         return jsonify({
             "answer": message.content[0].text.strip(),
-            "records_searched": len(insights),
+            "records_searched": total_loaded,
+            "debug": {
+                "records_loaded": total_loaded,
+                "records_used": len(top_rows),
+                "fields_used": fields,
+                "call_types_used": call_types,
+                "keywords_used": keywords,
+                "distinct_customers_used": distinct_customers,
+            }
         }), 200
 
     except Exception as e:
