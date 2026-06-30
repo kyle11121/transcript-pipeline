@@ -1,4 +1,4 @@
-Two changes, both surgical. Here's the full file:
+All 8 changes incorporated. Here's the full file:
 
 ```python
 """
@@ -40,6 +40,8 @@ SHEET_TAB_INSIGHTS = "Insights"
 SHEET_TAB_QUOTES   = "Quotes"
 SHEET_TAB_LOG      = "ProcessingLog"
 
+MIN_SCORE = 3
+
 # ── Load extraction prompt ────────────────────────────────────────────────────
 
 PROMPT_PATH = Path(__file__).parent / "extraction_prompt.txt"
@@ -60,7 +62,15 @@ When answering questions:
 - Separate findings by call type when the question benefits from it.
 - If the data doesn't support a confident answer, say so plainly.
 - Format your response with clear headers and bullets. Keep it tight.
-- Never fabricate evidence. Only use what's in the records provided."""
+- Never fabricate evidence. Only use what's in the records provided.
+
+When ranking patterns:
+- Count distinct customers first.
+- Count supporting calls second.
+- If evidence is insufficient to confidently rank patterns,
+  explicitly say so instead of forcing a ranking.
+- Mention approximate prevalence when possible
+  (for example "12 of 41 customers")."""
 
 INTENT_SYSTEM_PROMPT = """You are a query classifier for a B2B call transcript intelligence system.
 
@@ -71,9 +81,10 @@ Given a user question, return a JSON object with:
 - "call_types": list of relevant call types to filter on. Choose from:
     sales_discovery, sales_followup, delivery, renewal, escalation, qbr, internal, unknown
     Use empty list [] if all call types are relevant.
-- "keywords": list of 3-8 keywords or short phrases likely to appear in relevant records.
-    Think semantically — include synonyms and related terms.
-    Example: for "pricing objections" include ["price", "cost", "budget", "expensive", "too high", "pricing", "commercial"]
+- "keywords": list of search keywords, synonyms, abbreviations, and common customer phrasing
+    likely to appear in relevant records. Think semantically.
+    Example: for "pricing objections" include:
+    ["price", "pricing", "budget", "commercial", "expensive", "ROI", "cost", "costs", "too high", "over budget"]
 
 Return ONLY valid JSON. No preamble, no explanation, no markdown.
 
@@ -81,7 +92,7 @@ Example output:
 {
   "fields": ["sales_objections", "proposal_feedback"],
   "call_types": ["sales_discovery", "sales_followup", "renewal"],
-  "keywords": ["price", "cost", "budget", "expensive", "too high", "value", "ROI"]
+  "keywords": ["price", "pricing", "budget", "commercial", "expensive", "ROI", "cost", "too high", "over budget"]
 }"""
 
 # ── Cached Google clients ─────────────────────────────────────────────────────
@@ -281,11 +292,14 @@ def classify_intent(question: str) -> dict:
 def score_row(row: dict, fields: list, keywords: list) -> float:
     score = 0.0
 
-    for field in fields:
-        val = row.get(field, "")
-        if val and val.strip():
-            score += 2.0
+    # Populated relevant fields
+    populated_fields = sum(
+        1 for f in fields
+        if row.get(f, "").strip()
+    )
+    score += populated_fields * 2
 
+    # Build searchable text from relevant fields
     searchable = " ".join([
         row.get(f, "") for f in fields
     ] + [
@@ -293,17 +307,31 @@ def score_row(row: dict, fields: list, keywords: list) -> float:
         row.get("call_type", ""),
     ]).lower()
 
-    for kw in keywords:
-        if kw.lower() in searchable:
-            score += 1.0
+    # Keyword matches
+    keyword_matches = sum(1 for kw in keywords if kw.lower() in searchable)
+    score += keyword_matches * 3
+
+    # Customer name hit
+    customer_name = row.get("customer_name", "").lower()
+    customer_matches = sum(1 for kw in keywords if kw.lower() in customer_name)
+    score += customer_matches * 5
+
+    # Exact phrase hits (2+ word keywords)
+    phrase_matches = sum(
+        1 for kw in keywords
+        if len(kw.split()) > 1 and kw.lower() in searchable
+    )
+    score += phrase_matches * 6
 
     return score
 
 
-def build_context(insights: list, quotes: list, fields: list = None) -> str:
+def build_context(insights: list, quotes: list, fields: list = None, keywords: list = None) -> str:
     if fields is None:
         fields = ["sales_objections", "service_gaps", "proposal_feedback",
                   "delivery_risks", "churn_signals", "competitor_mentions"]
+    if keywords is None:
+        keywords = []
 
     quote_map = {}
     for q in quotes:
@@ -317,14 +345,17 @@ def build_context(insights: list, quotes: list, fields: list = None) -> str:
         cid = row.get("call_id", "")
         call_quotes = quote_map.get(cid, [])
 
-        relevant_quotes = [
-            q for q in call_quotes
-            if any(
-                kw in q.get("category", "").lower()
-                for f in fields
-                for kw in f.replace("_", " ").split() + [f.replace("_", " ")]
-            )
-        ] or call_quotes[:2]
+        relevant_quotes = []
+        for q in call_quotes:
+            searchable = (
+                (q.get("category") or "") + " " +
+                (q.get("text") or "")
+            ).lower()
+            if any(kw.lower() in searchable for kw in fields + keywords):
+                relevant_quotes.append(q)
+
+        if not relevant_quotes:
+            relevant_quotes = call_quotes[:2]
 
         quote_lines = ""
         if relevant_quotes:
@@ -438,7 +469,7 @@ APP_HTML = r"""
     .answer th { text-align: left; padding: 8px 12px; background: #0f1117;
                  border: 1px solid #2a2d3a; color: #aaa; }
     .answer td { padding: 8px 12px; border: 1px solid #2a2d3a; }
-    .meta { color: #555; font-size: 12px; margin-top: 16px; }
+    .meta { color: #555; font-size: 12px; margin-top: 16px; line-height: 1.8; }
     .loading { color: #888; font-size: 14px; padding: 20px 0; }
     .spinner { display: inline-block; width: 14px; height: 14px;
                border: 2px solid #333; border-top-color: #5b6af0;
@@ -534,15 +565,15 @@ APP_HTML = r"""
               + `fields: ${(debug.fields_used || []).join(', ')}`
             : d.records_searched + ' calls searched';
 
-          const topCalls = (debug.top_calls || []).map(c =>
-            `${c.customer} · ${c.call_date} · score: ${c.score}`
+          const topMatches = (debug.top_matches || []).map(c =>
+            `• ${c.customer} (${c.score})`
           ).join('<br>');
 
           result.innerHTML =
             '<div class="answer">' +
             marked(d.answer) +
             '<div class="meta">' + debugLine +
-            (topCalls ? '<br><br><span style="color:#444">Top retrieved:</span><br>' + topCalls : '') +
+            (topMatches ? '<br><br><span style="color:#444">Top matches:</span><br>' + topMatches : '') +
             '</div></div>';
         }
       })
@@ -622,10 +653,19 @@ def ask():
     data = request.get_json()
     question = data.get("question", "").strip()
     call_type_filter = data.get("call_type")
-    top_n = int(data.get("top_n", 75))
 
     if not question:
         return jsonify({"error": "No question provided"}), 400
+
+    # Dynamic retrieval size
+    question_lower = question.lower()
+    if any(word in question_lower for word in [
+        "top", "most", "common", "pattern",
+        "across", "frequently", "trend"
+    ]):
+        top_n = 125
+    else:
+        top_n = 40
 
     try:
         _, sheets = get_services()
@@ -654,10 +694,12 @@ def ask():
         # Score and rank
         scored = [(score_row(r, fields, keywords), r) for r in insights]
         scored.sort(key=lambda x: x[0], reverse=True)
-        scored = [(s, r) for s, r in scored if s > 0]
+
+        # Apply minimum score threshold
+        scored = [(s, r) for s, r in scored if s >= MIN_SCORE]
         top_rows = [r for _, r in scored[:top_n]]
 
-        # Fallback if scoring returns nothing
+        # Fallback if threshold filters everything
         if not top_rows:
             top_rows = insights[:top_n]
 
@@ -666,17 +708,17 @@ def ask():
         quotes = read_sheet(sheets, SHEET_TAB_QUOTES)
         quotes = [q for q in quotes if q.get("call_id") in call_ids]
 
-        context = build_context(top_rows, quotes, fields)
+        context = build_context(top_rows, quotes, fields, keywords)
         distinct_customers = len({r.get("customer_name", "") for r in top_rows if r.get("customer_name")})
 
-        # Top 10 calls for debug
-        top_calls_debug = [
+        # Top matches for debug
+        top_matches_debug = [
             {
                 "customer": r.get("customer_name", "unknown"),
-                "call_date": r.get("call_date", ""),
-                "score": round(score_row(r, fields, keywords), 1)
+                "call": r.get("call_id", ""),
+                "score": round(s, 1)
             }
-            for r in top_rows[:10]
+            for s, r in scored[:10]
         ]
 
         # Stage 2: synthesize
@@ -703,11 +745,11 @@ def ask():
             "debug": {
                 "records_loaded": total_loaded,
                 "records_used": len(top_rows),
+                "distinct_customers_used": distinct_customers,
                 "fields_used": fields,
                 "call_types_used": call_types,
                 "keywords_used": keywords,
-                "distinct_customers_used": distinct_customers,
-                "top_calls": top_calls_debug,
+                "top_matches": top_matches_debug,
             }
         }), 200
 
@@ -761,4 +803,4 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=port)
 ```
 
-Push and deploy.
+Push and deploy. Then use it for a week on real questions before touching it again.
