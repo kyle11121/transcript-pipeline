@@ -83,7 +83,11 @@ When analyzing AI-related themes, you must distinguish between these four catego
 
 Do not attribute complaints about third-party platform AI tools to Pivotree unless the customer explicitly connects the issue to Pivotree's offering, pricing, delivery, or recommendation.
 Do not treat a customer's internal AI access problem as a Pivotree service gap unless Pivotree is explicitly involved.
-Only report something as a Pivotree AI issue when the customer is clearly reacting to something Pivotree did, said, priced, or recommended."""
+Only report something as a Pivotree AI issue when the customer is clearly reacting to something Pivotree did, said, priced, or recommended.
+
+Do not combine unrelated observations simply because they involve the same technology or vendor.
+Criticism of a partner product, criticism of Pivotree's execution, and criticism of a pricing model are separate themes unless the transcript explicitly connects them.
+Keep themes distinct. Do not merge them into a single finding unless the customer does so explicitly."""
 
 INTENT_SYSTEM_PROMPT = """You are a query classifier for a B2B call transcript intelligence system.
 
