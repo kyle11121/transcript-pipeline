@@ -39,6 +39,12 @@ SHEET_TAB_LOG      = "ProcessingLog"
 
 MIN_SCORE = 3
 
+PERSPECTIVE_MAP = {
+    "sales": ["sales_discovery", "sales_followup"],
+    "pmo":   ["delivery", "escalation"],
+    "tam":   ["qbr", "renewal"],
+}
+
 # ── Load extraction prompt ────────────────────────────────────────────────────
 
 PROMPT_PATH = Path(__file__).parent / "extraction_prompt.txt"
@@ -67,7 +73,17 @@ When ranking patterns:
 - If evidence is insufficient to confidently rank patterns,
   explicitly say so instead of forcing a ranking.
 - Mention approximate prevalence when possible
-  (for example "12 of 41 customers")."""
+  (for example "12 of 41 customers").
+
+When analyzing AI-related themes, you must distinguish between these four categories:
+1. Pivotree's own AI services, pricing model, or AI-enabled delivery offering
+2. Pivotree's internal AI tooling used during delivery (e.g. Claude, Copilot)
+3. Third-party platform or vendor AI tools (e.g. Stibo AI, Syndigo AI, Informatica AI)
+4. Customer-owned AI tools, internal AI access constraints, or AI requests from the customer
+
+Do not attribute complaints about third-party platform AI tools to Pivotree unless the customer explicitly connects the issue to Pivotree's offering, pricing, delivery, or recommendation.
+Do not treat a customer's internal AI access problem as a Pivotree service gap unless Pivotree is explicitly involved.
+Only report something as a Pivotree AI issue when the customer is clearly reacting to something Pivotree did, said, priced, or recommended."""
 
 INTENT_SYSTEM_PROMPT = """You are a query classifier for a B2B call transcript intelligence system.
 
@@ -289,14 +305,12 @@ def classify_intent(question: str) -> dict:
 def score_row(row: dict, fields: list, keywords: list) -> float:
     score = 0.0
 
-    # Populated relevant fields
     populated_fields = sum(
         1 for f in fields
         if row.get(f, "").strip()
     )
     score += populated_fields * 2
 
-    # Build searchable text from relevant fields
     searchable = " ".join([
         row.get(f, "") for f in fields
     ] + [
@@ -304,16 +318,13 @@ def score_row(row: dict, fields: list, keywords: list) -> float:
         row.get("call_type", ""),
     ]).lower()
 
-    # Keyword matches
     keyword_matches = sum(1 for kw in keywords if kw.lower() in searchable)
     score += keyword_matches * 3
 
-    # Customer name hit
     customer_name = row.get("customer_name", "").lower()
     customer_matches = sum(1 for kw in keywords if kw.lower() in customer_name)
     score += customer_matches * 5
 
-    # Exact phrase hits (2+ word keywords)
     phrase_matches = sum(
         1 for kw in keywords
         if len(kw.split()) > 1 and kw.lower() in searchable
@@ -435,7 +446,6 @@ APP_HTML = r"""
               padding: 16px 32px; display: flex; align-items: center;
               justify-content: space-between; }
     .header h1 { font-size: 17px; font-weight: 600; }
-    .header span { color: #888; font-size: 13px; }
     .logout { color: #888; font-size: 13px; text-decoration: none; }
     .logout:hover { color: #e8e8e8; }
     .main { max-width: 860px; margin: 0 auto; padding: 40px 24px; }
@@ -483,7 +493,7 @@ APP_HTML = r"""
   <div class="header">
     <h1>Transcript Intelligence</h1>
     <div style="display:flex;gap:20px;align-items:center">
-      <span id="record-count">Loading...</span>
+      <span id="record-count" style="color:#888;font-size:13px;">Loading...</span>
       <a href="/logout" class="logout">Sign out</a>
     </div>
   </div>
@@ -658,7 +668,7 @@ def ask():
     question_lower = question.lower()
     if any(word in question_lower for word in [
         "top", "most", "common", "pattern",
-        "across", "frequently", "trend"
+        "across", "frequently", "trend", "theme", "brief", "summary"
     ]):
         top_n = 125
     else:
@@ -691,8 +701,6 @@ def ask():
         # Score and rank
         scored = [(score_row(r, fields, keywords), r) for r in insights]
         scored.sort(key=lambda x: x[0], reverse=True)
-
-        # Apply minimum score threshold
         scored = [(s, r) for s, r in scored if s >= MIN_SCORE]
         top_rows = [r for _, r in scored[:top_n]]
 
