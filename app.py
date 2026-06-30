@@ -1,6 +1,3 @@
-All 8 changes incorporated. Here's the full file:
-
-```python
 """
 Transcript Intelligence - Full Service
 ----------------------------------------
