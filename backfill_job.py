@@ -12,16 +12,16 @@ from googleapiclient.discovery import build
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 
 MODEL_EXTRACT = "claude-haiku-4-5-20251001"
 
 SHEET_TAB_INSIGHTS = "Insights"
 SHEET_TAB_QUOTES = "Quotes"
 SHEET_TAB_LOG = "ProcessingLog"
-SHEET_TAB_QUEUE = "FileQueue"
 
-MAX_FILES = int(os.environ.get("MAX_FILES", "25"))  # 0 = all pending
+MAX_FILES = int(os.environ.get("MAX_FILES", "0"))
 SLEEP_SECONDS = float(os.environ.get("SLEEP_SECONDS", "2"))
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -31,14 +31,26 @@ with open("extraction_prompt.txt", "r") as f:
 
 
 def get_services():
-    creds_dict = json.loads(GOOGLE_CREDS_JSON)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=[
-            "https://www.googleapis.com/auth/drive.readonly",
-            "https://www.googleapis.com/auth/spreadsheets",
-        ],
-    )
+    scopes = [
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
+
+    if GOOGLE_CREDS_JSON:
+        creds_dict = json.loads(GOOGLE_CREDS_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict,
+            scopes=scopes,
+        )
+    elif Path("service-account.json").exists():
+        creds = service_account.Credentials.from_service_account_file(
+            "service-account.json",
+            scopes=scopes,
+        )
+    else:
+        import google.auth
+        creds, _ = google.auth.default(scopes=scopes)
+
     drive = build("drive", "v3", credentials=creds)
     sheets = build("sheets", "v4", credentials=creds)
     return drive, sheets
@@ -49,34 +61,56 @@ def read_sheet(sheets, tab):
         spreadsheetId=GOOGLE_SHEET_ID,
         range=f"{tab}!A1:Z10000",
     ).execute()
+
     rows = result.get("values", [])
+
     if not rows:
         return [], []
+
     headers = rows[0]
     data = []
-    for i, row in enumerate(rows[1:], start=2):
+
+    for row in rows[1:]:
         record = dict(zip(headers, row + [""] * (len(headers) - len(row))))
-        record["_row_number"] = i
         data.append(record)
+
     return headers, data
 
 
-def update_queue_row(sheets, row_number, status, error_message="", tokens_used=""):
-    now = datetime.utcnow().isoformat()
-    values = [[status, now, error_message[:500], tokens_used]]
-    sheets.spreadsheets().values().update(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"{SHEET_TAB_QUEUE}!C{row_number}:F{row_number}",
-        valueInputOption="RAW",
-        body={"values": values},
-    ).execute()
+def list_drive_files(drive):
+    files = []
+    page_token = None
+
+    query = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
+
+    while True:
+        response = drive.files().list(
+            q=query,
+            spaces="drive",
+            fields="nextPageToken, files(id, name, modifiedTime)",
+            pageSize=1000,
+            pageToken=page_token,
+            orderBy="modifiedTime desc",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+
+        files.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+
+        if not page_token:
+            break
+
+    return files
 
 
 def download_file_text(drive, file_id):
     request_obj = drive.files().get_media(fileId=file_id)
     content = request_obj.execute()
+
     if isinstance(content, bytes):
         return content.decode("utf-8", errors="replace")
+
     return str(content)
 
 
@@ -106,10 +140,11 @@ def extract_transcript(transcript_text, source_file):
 def arr_to_str(val):
     if isinstance(val, list):
         return " | ".join(str(v) for v in val if v)
+
     return val if val is not None else ""
 
 
-def write_to_sheets(sheets, call_id, extraction):
+def write_to_sheets(sheets, call_id, file_id, extraction):
     now = datetime.utcnow().isoformat()
 
     insight_row = [[
@@ -142,6 +177,7 @@ def write_to_sheets(sheets, call_id, extraction):
     ).execute()
 
     quotes = extraction.get("key_quotes", [])
+
     if quotes:
         quote_rows = [[
             call_id,
@@ -174,24 +210,48 @@ def write_to_sheets(sheets, call_id, extraction):
             "",
             extraction.get("_tokens_used", ""),
             now,
+            file_id,
         ]]},
     ).execute()
 
 
 def main():
-    print("Starting Cloud Run backfill job")
+    print("Starting Cloud Run transcript job")
 
     drive, sheets = get_services()
-    _, queue_rows = read_sheet(sheets, SHEET_TAB_QUEUE)
 
-    pending = [
-        r for r in queue_rows
-        if r.get("status", "").strip().lower() in ("pending", "")
-    ]
+    _, log_rows = read_sheet(sheets, SHEET_TAB_LOG)
+
+    processed_file_ids = {
+        str(r.get("file_id", "")).strip()
+        for r in log_rows
+        if str(r.get("status", "")).strip().lower() == "success"
+        and str(r.get("file_id", "")).strip()
+    }
+
+    drive_files = list_drive_files(drive)
+
+    pending = []
+
+    for file in drive_files:
+        file_id = file.get("id", "").strip()
+        file_name = file.get("name", "").strip()
+
+        if not file_name.lower().endswith(".txt"):
+            continue
+
+        if file_id in processed_file_ids:
+            continue
+
+        pending.append({
+            "file_id": file_id,
+            "file_name": file_name,
+        })
 
     if MAX_FILES > 0:
         pending = pending[:MAX_FILES]
 
+    print(f"Drive files found: {len(drive_files)}")
     print(f"Pending files selected: {len(pending)}")
 
     success = 0
@@ -199,45 +259,31 @@ def main():
     skipped = 0
 
     for row in pending:
-        file_id = row.get("file_id", "").strip()
-        file_name = row.get("file_name", "").strip()
-        row_number = row["_row_number"]
-        call_id = Path(file_name).stem
+        file_id = row["file_id"]
+        file_name = row["file_name"]
+        call_id = (
+            file_name[:-4] if file_name.lower().endswith(".txt") else file_name
+        ).strip()
 
-        if not file_id:
-            update_queue_row(sheets, row_number, "error", "Missing file_id")
-            errors += 1
-            continue
-
-        print(f"Processing row {row_number}: {file_name}")
+        print(f"Processing: {file_name}")
 
         try:
             transcript_text = download_file_text(drive, file_id)
 
             if len(transcript_text.strip()) < 200:
-                update_queue_row(sheets, row_number, "skipped", "Transcript too short")
                 skipped += 1
+                print(f"Skipped: {file_name} — transcript too short")
                 continue
 
             extraction = extract_transcript(transcript_text, file_name)
-            write_to_sheets(sheets, call_id, extraction)
-
-            update_queue_row(
-                sheets,
-                row_number,
-                "success",
-                "",
-                str(extraction.get("_tokens_used", "")),
-            )
+            write_to_sheets(sheets, call_id, file_id, extraction)
 
             success += 1
             print(f"Success: {file_name}")
 
         except Exception as e:
-            error_text = str(e)
-            print(f"ERROR {file_name}: {error_text}")
-            update_queue_row(sheets, row_number, "error", error_text)
             errors += 1
+            print(f"ERROR {file_name}: {str(e)}")
 
         time.sleep(SLEEP_SECONDS)
 
