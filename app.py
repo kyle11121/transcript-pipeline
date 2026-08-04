@@ -668,15 +668,18 @@ def ask():
     if not question:
         return jsonify({"error": "No question provided"}), 400
 
-    # Dynamic retrieval size
+    # Dynamic retrieval size.
+    # Named-account questions use ALL matching calls.
+    # Broader thematic questions use a larger ranked evidence set.
     question_lower = question.lower()
     if any(word in question_lower for word in [
         "top", "most", "common", "pattern",
-        "across", "frequently", "trend", "theme", "brief", "summary"
+        "across", "frequently", "trend", "theme",
+        "brief", "summary", "overall", "biggest"
     ]):
-        top_n = 125
+        top_n = 300
     else:
-        top_n = 40
+        top_n = 150
 
     try:
         _, sheets = get_services()
@@ -687,30 +690,95 @@ def ask():
         call_types = intent.get("call_types", [])
         keywords   = intent.get("keywords", [])
 
-        # Manual call type override
-        if call_type_filter:
-            call_types = [call_type_filter]
-
-        # Load insights
+        # Load ALL insights before deciding which records to retrieve
         insights = read_sheet(sheets, SHEET_TAB_INSIGHTS)
         total_loaded = len(insights)
 
-        # Filter by call type
-        if call_types:
-            insights = [
+        # Normalize names so punctuation differences do not prevent matching.
+        def normalize_name(value):
+            return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+        normalized_question = normalize_name(question)
+
+        # Find customer names explicitly mentioned in the user's question.
+        customer_names = {
+            r.get("customer_name", "").strip()
+            for r in insights
+            if r.get("customer_name", "").strip()
+        }
+
+        matched_customers = []
+
+        for customer in customer_names:
+            normalized_customer = normalize_name(customer)
+
+            if (
+                len(normalized_customer) >= 3
+                and normalized_customer in normalized_question
+            ):
+                matched_customers.append(customer)
+
+        # Manual UI call-type filter always wins.
+        if call_type_filter:
+            call_types = [call_type_filter]
+
+        if matched_customers:
+            # IMPORTANT:
+            # When the user explicitly names accounts, retrieve EVERY call
+            # for those accounts. Do not discard calls because of relevance score.
+            matched_normalized = {
+                normalize_name(c)
+                for c in matched_customers
+            }
+
+            top_rows = [
                 r for r in insights
-                if r.get("call_type", "").lower() in [ct.lower() for ct in call_types]
+                if normalize_name(r.get("customer_name", "")) in matched_normalized
             ]
 
-        # Score and rank
-        scored = [(score_row(r, fields, keywords), r) for r in insights]
-        scored.sort(key=lambda x: x[0], reverse=True)
-        scored = [(s, r) for s, r in scored if s >= MIN_SCORE]
-        top_rows = [r for _, r in scored[:top_n]]
+            if call_type_filter:
+                top_rows = [
+                    r for r in top_rows
+                    if r.get("call_type", "").lower() == call_type_filter.lower()
+                ]
 
-        # Fallback if threshold filters everything
-        if not top_rows:
-            top_rows = insights[:top_n]
+            # Score for debug/ranking display only.
+            scored = [
+                (score_row(r, fields, keywords), r)
+                for r in top_rows
+            ]
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+        else:
+            # Non-account questions can still use intent-based call-type filtering.
+            if call_types:
+                allowed_types = {ct.lower() for ct in call_types}
+
+                insights = [
+                    r for r in insights
+                    if r.get("call_type", "").lower() in allowed_types
+                ]
+
+            # Relevance-rank broader thematic questions.
+            scored = [
+                (score_row(r, fields, keywords), r)
+                for r in insights
+            ]
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            scored = [
+                (s, r)
+                for s, r in scored
+                if s >= MIN_SCORE
+            ]
+
+            top_rows = [
+                r for _, r in scored[:top_n]
+            ]
+
+            # Fallback if the score threshold filters everything.
+            if not top_rows:
+                top_rows = insights[:top_n]
 
         # Load quotes for selected calls only
         call_ids = {r.get("call_id") for r in top_rows}
@@ -750,7 +818,7 @@ def ask():
 
         return jsonify({
             "answer": message.content[0].text.strip(),
-            "records_searched": total_loaded,
+            "records_searched": len(top_rows),
             "debug": {
                 "records_loaded": total_loaded,
                 "records_used": len(top_rows),
