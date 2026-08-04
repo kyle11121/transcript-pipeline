@@ -700,16 +700,38 @@ def ask():
 
         normalized_question = normalize_name(question)
 
-        # Find customer names explicitly mentioned in the user's question.
-        customer_names = {
-            r.get("customer_name", "").strip()
-            for r in insights
-            if r.get("customer_name", "").strip()
-        }
+        # Build account aliases from both the AI-extracted customer_name
+        # and the company prefix in the transcript source filename.
+        def source_account_name(row):
+            source = str(row.get("source_file", "")).strip()
+
+            # Standard Gong filename:
+            # Customer Name - YYYY-MM-DD - Call Title.txt
+            match = re.match(
+                r"^(.*?)\\s+-\\s+\\d{4}-\\d{2}-\\d{2}\\s+-\\s+",
+                source
+            )
+
+            if match:
+                return match.group(1).strip()
+
+            return ""
+
+        account_aliases = set()
+
+        for r in insights:
+            customer = str(r.get("customer_name", "")).strip()
+            source_customer = source_account_name(r)
+
+            if customer:
+                account_aliases.add(customer)
+
+            if source_customer:
+                account_aliases.add(source_customer)
 
         matched_customers = []
 
-        for customer in customer_names:
+        for customer in account_aliases:
             normalized_customer = normalize_name(customer)
 
             if (
@@ -733,7 +755,11 @@ def ask():
 
             top_rows = [
                 r for r in insights
-                if normalize_name(r.get("customer_name", "")) in matched_normalized
+                if (
+                    normalize_name(r.get("customer_name", "")) in matched_normalized
+                    or
+                    normalize_name(source_account_name(r)) in matched_normalized
+                )
             ]
 
             if call_type_filter:
