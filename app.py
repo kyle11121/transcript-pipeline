@@ -776,6 +776,12 @@ def ask():
         for customer in account_aliases:
             normalized_customer = normalize_name(customer)
 
+            # Pivotree is our own organization, not a customer account.
+            # Mentions such as "what did Pivotree miss?" must not trigger
+            # named-account retrieval.
+            if normalized_customer == "pivotree":
+                continue
+
             if (
                 len(normalized_customer) >= 3
                 and normalized_customer in normalized_question
