@@ -70,6 +70,8 @@ When answering questions:
 - Clearly distinguish explicit dollar amounts stated in the evidence from inferred commercial estimates.
 - If a dollar value is not explicitly supported by the records, say "value not explicitly stated" rather than inventing a range.
 - If you make a directional commercial inference, label it explicitly as an inference and explain the supporting evidence.
+- Never state an exact or approximate number of customers exhibiting a pattern unless that count can be directly established from the provided records.
+- If the customer count for a pattern is uncertain, say "multiple customers" and list the known examples instead of inventing or estimating a count.
 
 When ranking patterns:
 - Count distinct customers first.
