@@ -33,7 +33,7 @@ APP_PASSWORD       = os.environ.get("APP_PASSWORD", "pivotree2026")
 DRIVE_FOLDER_ID    = os.environ.get("DRIVE_FOLDER_ID", "")
 MODEL_EXTRACT      = "claude-haiku-4-5-20251001"
 MODEL_QUERY        = "claude-sonnet-4-6"
-SHEET_TAB_INSIGHTS = "Insights"
+SHEET_TAB_INSIGHTS = "Insights_v5"
 SHEET_TAB_QUOTES   = "Quotes"
 SHEET_TAB_LOG      = "ProcessingLog"
 
@@ -93,8 +93,10 @@ INTENT_SYSTEM_PROMPT = """You are a query classifier for a B2B call transcript i
 
 Given a user question, return a JSON object with:
 - "fields": list of relevant schema fields to search. Choose from:
-    sales_objections, service_gaps, proposal_feedback, delivery_risks,
-    churn_signals, competitor_mentions, key_quotes
+    customer_pain_points, customer_requests, buying_signals, expansion_signals,
+    missed_opportunities, sales_objections, proposal_feedback, delivery_risks,
+    churn_signals, pivotree_improvement_opportunities, partner_mentions,
+    competitive_mentions, ai_mentions
 - "call_types": list of relevant call types to filter on. Choose from:
     sales_discovery, sales_followup, delivery, renewal, escalation, qbr, internal, unknown
     Use empty list [] if all call types are relevant.
@@ -299,8 +301,10 @@ def classify_intent(question: str) -> dict:
         return json.loads(raw)
     except Exception:
         return {
-            "fields": ["sales_objections", "service_gaps", "proposal_feedback",
-                       "delivery_risks", "churn_signals", "competitor_mentions"],
+            "fields": ["customer_pain_points", "customer_requests", "buying_signals", "expansion_signals",
+                       "missed_opportunities", "sales_objections", "proposal_feedback", "delivery_risks",
+                       "churn_signals", "pivotree_improvement_opportunities", "partner_mentions",
+                       "competitive_mentions", "ai_mentions"],
             "call_types": [],
             "keywords": []
         }
@@ -340,8 +344,10 @@ def score_row(row: dict, fields: list, keywords: list) -> float:
 
 def build_context(insights: list, quotes: list, fields: list = None, keywords: list = None) -> str:
     if fields is None:
-        fields = ["sales_objections", "service_gaps", "proposal_feedback",
-                  "delivery_risks", "churn_signals", "competitor_mentions"]
+        fields = ["customer_pain_points", "customer_requests", "buying_signals", "expansion_signals",
+                  "missed_opportunities", "sales_objections", "proposal_feedback", "delivery_risks",
+                  "churn_signals", "pivotree_improvement_opportunities", "partner_mentions",
+                  "competitive_mentions", "ai_mentions"]
     if keywords is None:
         keywords = []
 
@@ -860,9 +866,11 @@ def ask():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/process-transcript", methods=["POST"])
+@app.route("/process-transcript-disabled", methods=["POST"])
 @require_api_secret
 def process_transcript():
+    return jsonify({"error": "Transcript ingestion endpoint retired; use Cloud Run ingestion."}), 410
+
     data = request.get_json()
     if not data:
         return jsonify({"error": "No JSON body"}), 400
