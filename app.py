@@ -12,7 +12,7 @@ import os
 import json
 import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for
@@ -678,11 +678,13 @@ def ask():
     # Named-account questions use ALL matching calls.
     # Broader thematic questions use a larger ranked evidence set.
     question_lower = question.lower()
-    if any(word in question_lower for word in [
+    broad_query = any(word in question_lower for word in [
         "top", "most", "common", "pattern",
         "across", "frequently", "trend", "theme",
         "brief", "summary", "overall", "biggest"
-    ]):
+    ])
+
+    if broad_query:
         top_n = 300
     else:
         top_n = 150
@@ -699,6 +701,40 @@ def ask():
         # Load ALL insights before deciding which records to retrieve
         insights = read_sheet(sheets, SHEET_TAB_INSIGHTS)
         total_loaded = len(insights)
+
+        # Honor relative date language such as:
+        # "last 90 days", "past 6 weeks", "last 3 months".
+        relative_days = None
+
+        match = re.search(r"\b(?:last|past)\s+(\d+)\s+days?\b", question_lower)
+        if match:
+            relative_days = int(match.group(1))
+
+        if relative_days is None:
+            match = re.search(r"\b(?:last|past)\s+(\d+)\s+weeks?\b", question_lower)
+            if match:
+                relative_days = int(match.group(1)) * 7
+
+        if relative_days is None:
+            match = re.search(r"\b(?:last|past)\s+(\d+)\s+months?\b", question_lower)
+            if match:
+                relative_days = int(match.group(1)) * 30
+
+        if relative_days is not None:
+            cutoff_date = datetime.utcnow().date() - timedelta(days=relative_days)
+
+            def row_call_date(row):
+                raw = str(row.get("call_date", "")).strip()
+                try:
+                    return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+                except (ValueError, TypeError):
+                    return None
+
+            insights = [
+                r for r in insights
+                if row_call_date(r) is not None
+                and row_call_date(r) >= cutoff_date
+            ]
 
         # Normalize names so punctuation differences do not prevent matching.
         def normalize_name(value):
@@ -782,6 +818,21 @@ def ask():
             scored.sort(key=lambda x: x[0], reverse=True)
 
         else:
+            # Broad customer-portfolio questions should analyze actual customer
+            # conversations, not Pivotree's own procurement/internal activity.
+            customer_portfolio_query = broad_query and any(
+                term in question_lower
+                for term in ["customer", "customers", "client", "clients", "account", "accounts"]
+            )
+
+            if customer_portfolio_query:
+                insights = [
+                    r for r in insights
+                    if r.get("call_type", "").lower() != "internal"
+                    and normalize_name(r.get("customer_name", "")) != "pivotree"
+                    and normalize_name(source_account_name(r)) != "pivotree"
+                ]
+
             # Non-account questions can still use intent-based call-type filtering.
             if call_types:
                 allowed_types = {ct.lower() for ct in call_types}
@@ -791,26 +842,32 @@ def ask():
                     if r.get("call_type", "").lower() in allowed_types
                 ]
 
-            # Relevance-rank broader thematic questions.
+            # Relevance-rank thematic questions.
             scored = [
                 (score_row(r, fields, keywords), r)
                 for r in insights
             ]
             scored.sort(key=lambda x: x[0], reverse=True)
 
-            scored = [
-                (s, r)
-                for s, r in scored
-                if s >= MIN_SCORE
-            ]
+            if broad_query:
+                # For portfolio/trend questions, do not let MIN_SCORE collapse
+                # the evidence set to only a handful of calls.
+                top_rows = [
+                    r for _, r in scored[:top_n]
+                ]
+            else:
+                scored = [
+                    (s, r)
+                    for s, r in scored
+                    if s >= MIN_SCORE
+                ]
 
-            top_rows = [
-                r for _, r in scored[:top_n]
-            ]
+                top_rows = [
+                    r for _, r in scored[:top_n]
+                ]
 
-            # Fallback if the score threshold filters everything.
-            if not top_rows:
-                top_rows = insights[:top_n]
+                if not top_rows:
+                    top_rows = insights[:top_n]
 
         # Load quotes for selected calls only
         call_ids = {r.get("call_id") for r in top_rows}
