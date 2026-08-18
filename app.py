@@ -19,9 +19,11 @@ from flask import Flask, request, jsonify, render_template_string, session, redi
 import anthropic
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from salesforce_auth import salesforce_bp
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-in-production")
+app.register_blueprint(salesforce_bp)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
