@@ -1006,8 +1006,8 @@ def ask():
                         "mcp_server_name": "salesforce",
                         "default_config": {"enabled": False},
                         "configs": {
-                            "getObjectSchema": {"enabled": True},
-                            "soqlQuery": {"enabled": True},
+                            "getObjectSchemaplatform_sobject_reads": {"enabled": True},
+                            "soqlQueryplatform_sobject_reads": {"enabled": True},
                         },
                     }],
                     betas=["mcp-client-2025-11-20"],
@@ -1023,7 +1023,7 @@ def ask():
                 soql_uses_by_id = {
                     getattr(block, "id", ""): block
                     for block in mcp_tool_uses
-                    if getattr(block, "name", "") == "soqlQuery"
+                    if getattr(block, "name", "").startswith("soqlQuery")
                     and getattr(block, "id", "")
                 }
 
