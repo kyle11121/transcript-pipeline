@@ -1010,7 +1010,6 @@ def ask():
                             "soqlQuery": {"enabled": True},
                         },
                     }],
-                    tool_choice={"type": "any"},
                     betas=["mcp-client-2025-11-20"],
                 )
 
