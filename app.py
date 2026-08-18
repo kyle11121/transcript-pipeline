@@ -758,7 +758,7 @@ def ask():
             # Standard Gong filename:
             # Customer Name - YYYY-MM-DD - Call Title.txt
             match = re.match(
-                r"^(.*?)\\s+-\\s+\\d{4}-\\d{2}-\\d{2}\\s+-\\s+",
+                r"^(.*?)\s+-\s+\d{4}-\d{2}-\d{2}\s+-\s+",
                 source
             )
 
@@ -779,21 +779,75 @@ def ask():
             if source_customer:
                 account_aliases.add(source_customer)
 
+        # Match both exact CRM-style names and natural shortened account names.
+        # Examples:
+        #   "Reitmans" -> "Reitmans Canada Limited"
+        #   "Stanley Black & Decker" -> "Stanley Black & Decker, Inc"
+        #   "Blackhawk" -> "BlackHawk Industrial" when that leading token is unique.
+        corporate_suffixes = {
+            "inc", "incorporated", "corp", "corporation", "llc", "ltd",
+            "limited", "plc", "company", "co", "holdings", "holding",
+            "canada", "usa", "us"
+        }
+
+        def canonical_account_name(value):
+            words = normalize_name(value).split()
+            while len(words) > 1 and words[-1] in corporate_suffixes:
+                words.pop()
+            return " ".join(words)
+
+        canonical_by_customer = {
+            customer: canonical_account_name(customer)
+            for customer in account_aliases
+        }
+
+        # A one-word shorthand is only safe when it identifies exactly one
+        # canonical account in the corpus.
+        first_token_accounts = {}
+        for canonical in canonical_by_customer.values():
+            parts = canonical.split()
+            if parts and len(parts[0]) >= 6:
+                first_token_accounts.setdefault(parts[0], set()).add(canonical)
+
         matched_customers = []
 
         for customer in account_aliases:
             normalized_customer = normalize_name(customer)
+            canonical_customer = canonical_by_customer[customer]
 
             # Pivotree is our own organization, not a customer account.
-            # Mentions such as "what did Pivotree miss?" must not trigger
-            # named-account retrieval.
-            if normalized_customer == "pivotree":
+            if normalized_customer == "pivotree" or canonical_customer == "pivotree":
                 continue
 
-            if (
+            exact_full_match = (
                 len(normalized_customer) >= 3
-                and normalized_customer in normalized_question
-            ):
+                and re.search(
+                    rf"\b{re.escape(normalized_customer)}\b",
+                    normalized_question
+                )
+            )
+
+            canonical_match = (
+                len(canonical_customer) >= 4
+                and re.search(
+                    rf"\b{re.escape(canonical_customer)}\b",
+                    normalized_question
+                )
+            )
+
+            parts = canonical_customer.split()
+            first_token = parts[0] if parts else ""
+            unique_short_match = (
+                len(parts) >= 2
+                and len(first_token) >= 6
+                and len(first_token_accounts.get(first_token, set())) == 1
+                and re.search(
+                    rf"\b{re.escape(first_token)}\b",
+                    normalized_question
+                )
+            )
+
+            if exact_full_match or canonical_match or unique_short_match:
                 matched_customers.append(customer)
 
         # Manual UI call-type filter always wins.
