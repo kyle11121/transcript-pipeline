@@ -955,7 +955,7 @@ def ask():
             for s, r in scored[:10]
         ]
 
-        # Stage 2: synthesize with optional read-only Salesforce enrichment
+        # Stage 2: synthesize. Salesforce is invoked only for CRM-specific questions.
         user_prompt = (
             f"Here is extracted intelligence from {len(top_rows)} calls "
             f"across {distinct_customers} distinct customers:\n\n"
@@ -965,55 +965,179 @@ def ask():
             f"call frequency second. Do not let one customer dominate."
         )
 
-        salesforce_status = "available"
-        try:
-            sf_access_token = get_salesforce_access_token()
-            sf_system_prompt = QUERY_SYSTEM_PROMPT + (
-                "\n\nYou have read-only Salesforce tools. Salesforce is the current CRM "
-                "system of record; transcripts are conversation evidence. Use Salesforce "
-                "when it materially helps answer questions about a named account, opportunity, "
-                "pipeline, stage, amount, close date, forecast, owner, or renewal. Otherwise "
-                "answer from transcript evidence without unnecessary Salesforce calls. "
-                "Never invent CRM values. Clearly distinguish Salesforce facts, transcript "
-                "evidence, and inference. Never attempt any write, update, or delete action."
-            )
-            message = anthropic_client.beta.messages.create(
-                model=MODEL_QUERY,
-                max_tokens=4096,
-                system=sf_system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-                mcp_servers=[{
-                    "type": "url",
-                    "url": SALESFORCE_MCP_URL,
-                    "name": "salesforce",
-                    "authorization_token": sf_access_token,
-                }],
-                tools=[{
-                    "type": "mcp_toolset",
-                    "mcp_server_name": "salesforce",
-                    "default_config": {"enabled": False},
-                    "configs": {
-                        "getObjectSchema": {"enabled": True},
-                        "soqlQuery": {"enabled": True},
-                    },
-                }],
-                betas=["mcp-client-2025-11-20"],
-            )
-        except Exception as sf_exc:
-            salesforce_status = "unavailable"
-            print("Salesforce enrichment failed:", type(sf_exc).__name__, str(sf_exc), flush=True)
+        salesforce_requested = any(term in question_lower for term in [
+            "salesforce", "crm", "opportunity", "opportunities", " opp ",
+            " opps ", "pipeline", "forecast", "forecasting", "stage",
+            "close date", "account owner", "opportunity owner", "renewal date"
+        ])
+
+        salesforce_status = "not_requested"
+        salesforce_tools_used = []
+        salesforce_result_count = 0
+
+        if salesforce_requested:
+            try:
+                sf_access_token = get_salesforce_access_token()
+                sf_system_prompt = QUERY_SYSTEM_PROMPT + (
+                    "\n\nYou have read-only Salesforce tools. Salesforce is the current CRM "
+                    "system of record; transcripts are conversation evidence. Because this question "
+                    "asks for CRM/Salesforce information, you MUST execute at least one real Salesforce "
+                    "Salesforce soqlQuery MCP tool before stating any CRM fact. Every SOQL query must include a WHERE clause and a LIMIT clause. Do not simulate tool calls, do not print "
+                    "function-call XML or pseudo-tool markup, and do not invent Salesforce records or "
+                    "values. Clearly distinguish Salesforce facts, transcript evidence, and inference. "
+                    "Never attempt any write, update, or delete action. A transcript participant is not "
+                    "the Salesforce account/opportunity owner unless an Owner field returned by Salesforce "
+                    "establishes that. Do not call work billable, booked, pipeline, or revenue unless that "
+                    "commercial status is explicitly supported by Salesforce or transcript evidence."
+                )
+                message = anthropic_client.beta.messages.create(
+                    model=MODEL_QUERY,
+                    max_tokens=4096,
+                    system=sf_system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                    mcp_servers=[{
+                        "type": "url",
+                        "url": SALESFORCE_MCP_URL,
+                        "name": "salesforce",
+                        "authorization_token": sf_access_token,
+                    }],
+                    tools=[{
+                        "type": "mcp_toolset",
+                        "mcp_server_name": "salesforce",
+                        "default_config": {"enabled": False},
+                        "configs": {
+                            "getObjectSchema": {"enabled": True},
+                            "soqlQuery": {"enabled": True},
+                        },
+                    }],
+                    tool_choice={"type": "any"},
+                    betas=["mcp-client-2025-11-20"],
+                )
+
+                # Trust Salesforce only when a successful MCP result matches a real
+                # Salesforce soqlQuery invocation by tool_use_id.
+                mcp_tool_uses = [
+                    block for block in message.content
+                    if getattr(block, "type", "") == "mcp_tool_use"
+                    and getattr(block, "server_name", "") == "salesforce"
+                ]
+                soql_uses_by_id = {
+                    getattr(block, "id", ""): block
+                    for block in mcp_tool_uses
+                    if getattr(block, "name", "") == "soqlQuery"
+                    and getattr(block, "id", "")
+                }
+
+                verified_soql_results = [
+                    block for block in message.content
+                    if getattr(block, "type", "") == "mcp_tool_result"
+                    and getattr(block, "tool_use_id", "") in soql_uses_by_id
+                    and not getattr(block, "is_error", False)
+                ]
+
+                salesforce_tools_used = [
+                    getattr(block, "name", "unknown") for block in mcp_tool_uses
+                ]
+                salesforce_result_count = len(verified_soql_results)
+
+                def mcp_result_text(block):
+                    content = getattr(block, "content", "")
+                    if isinstance(content, str):
+                        return content
+                    if isinstance(content, list):
+                        return "\n".join(
+                            getattr(part, "text", "")
+                            for part in content
+                            if getattr(part, "type", "") == "text"
+                            and getattr(part, "text", None)
+                        )
+                    return str(content)
+
+                if verified_soql_results:
+                    salesforce_status = "verified"
+
+                    # Discard first-pass prose. Re-synthesize from transcript evidence plus
+                    # only the raw results of verified Salesforce soqlQuery executions.
+                    sf_evidence_parts = []
+                    for idx, result_block in enumerate(verified_soql_results, start=1):
+                        tool_use = soql_uses_by_id[
+                            getattr(result_block, "tool_use_id", "")
+                        ]
+                        sf_evidence_parts.append(
+                            f"Salesforce SOQL query {idx} input:\n"
+                            f"{json.dumps(getattr(tool_use, 'input', {}), ensure_ascii=False)}\n"
+                            f"Salesforce SOQL query {idx} result:\n"
+                            f"{mcp_result_text(result_block)}"
+                        )
+
+                    verified_sf_context = "\n\n".join(sf_evidence_parts)
+
+                    verified_system_prompt = QUERY_SYSTEM_PROMPT + (
+                        "\n\nVERIFIED SALESFORCE RULES: Salesforce facts may come ONLY from "
+                        "the VERIFIED SALESFORCE MCP EVIDENCE included in the user message. "
+                        "Do not add, infer, or invent any Salesforce record, amount, stage, "
+                        "close date, owner, probability, forecast category, contract, case, "
+                        "activity, or field value not explicitly present there. If a requested "
+                        "CRM fact is absent, say it was not established by the verified results. "
+                        "Keep transcript evidence, Salesforce facts, and inference clearly separate. "
+                        "A transcript participant is not a Salesforce owner unless the verified CRM "
+                        "evidence explicitly says so. Do not describe work as billable, booked, "
+                        "pipeline, or revenue unless the evidence explicitly supports that status."
+                    )
+
+                    message = anthropic_client.messages.create(
+                        model=MODEL_QUERY,
+                        max_tokens=4096,
+                        system=verified_system_prompt,
+                        messages=[{
+                            "role": "user",
+                            "content": (
+                                user_prompt
+                                + "\n\n--- VERIFIED SALESFORCE MCP EVIDENCE ---\n"
+                                + verified_sf_context
+                            ),
+                        }],
+                    )
+                else:
+                    salesforce_status = "unverified"
+                    message = anthropic_client.messages.create(
+                        model=MODEL_QUERY,
+                        max_tokens=4096,
+                        system=QUERY_SYSTEM_PROMPT,
+                        messages=[{
+                            "role": "user",
+                            "content": user_prompt + (
+                                "\n\nSalesforce was requested, but the application did not receive "
+                                "a successful Salesforce soqlQuery result matched to a real MCP tool "
+                                "invocation. Answer from transcript evidence only. Do not state or imply "
+                                "any Salesforce record, opportunity, amount, stage, close date, owner, "
+                                "forecast, contract, case, or other CRM fact. Explicitly say Salesforce "
+                                "could not be verified for this request."
+                            ),
+                        }],
+                    )
+            except Exception as sf_exc:
+                salesforce_status = "unavailable"
+                print("Salesforce enrichment failed:", type(sf_exc).__name__, str(sf_exc), flush=True)
+                message = anthropic_client.messages.create(
+                    model=MODEL_QUERY,
+                    max_tokens=4096,
+                    system=QUERY_SYSTEM_PROMPT,
+                    messages=[{
+                        "role": "user",
+                        "content": user_prompt + (
+                            "\n\nSalesforce was unavailable for this request. Answer from transcript "
+                            "evidence only. Do not state or imply any Salesforce/CRM facts, and explicitly "
+                            "say Salesforce could not be checked."
+                        ),
+                    }],
+                )
+        else:
             message = anthropic_client.messages.create(
                 model=MODEL_QUERY,
                 max_tokens=4096,
                 system=QUERY_SYSTEM_PROMPT,
-                messages=[{
-                    "role": "user",
-                    "content": user_prompt + (
-                        "\n\nSalesforce was unavailable for this request. Answer from "
-                        "transcript evidence only and explicitly say Salesforce could not be checked "
-                        "if the question requires CRM data."
-                    ),
-                }],
+                messages=[{"role": "user", "content": user_prompt}],
             )
 
         answer_text = "\n".join(
@@ -1028,6 +1152,8 @@ def ask():
                 "records_loaded": total_loaded,
                 "records_used": len(top_rows),
                 "salesforce_status": salesforce_status,
+                "salesforce_tools_used": salesforce_tools_used,
+                "salesforce_result_count": salesforce_result_count,
                 "distinct_customers_used": distinct_customers,
                 "fields_used": fields,
                 "call_types_used": call_types,
