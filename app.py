@@ -19,7 +19,7 @@ from flask import Flask, request, jsonify, render_template_string, session, redi
 import anthropic
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from salesforce_auth import salesforce_bp
+from salesforce_auth import salesforce_bp, get_salesforce_access_token, SALESFORCE_MCP_URL
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-in-production")
@@ -901,30 +901,79 @@ def ask():
             for s, r in scored[:10]
         ]
 
-        # Stage 2: synthesize
-        message = anthropic_client.messages.create(
-            model=MODEL_QUERY,
-            max_tokens=4096,
-            system=QUERY_SYSTEM_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Here is extracted intelligence from {len(top_rows)} calls "
-                    f"across {distinct_customers} distinct customers:\n\n"
-                    f"{context}\n\n---\n\n"
-                    f"Question: {question}\n\n"
-                    f"Remember: count patterns by distinct customers first, "
-                    f"call frequency second. Do not let one customer dominate."
-                )
-            }]
+        # Stage 2: synthesize with optional read-only Salesforce enrichment
+        user_prompt = (
+            f"Here is extracted intelligence from {len(top_rows)} calls "
+            f"across {distinct_customers} distinct customers:\n\n"
+            f"{context}\n\n---\n\n"
+            f"Question: {question}\n\n"
+            f"Remember: count patterns by distinct customers first, "
+            f"call frequency second. Do not let one customer dominate."
         )
 
+        salesforce_status = "available"
+        try:
+            sf_access_token = get_salesforce_access_token()
+            sf_system_prompt = QUERY_SYSTEM_PROMPT + (
+                "\n\nYou have read-only Salesforce tools. Salesforce is the current CRM "
+                "system of record; transcripts are conversation evidence. Use Salesforce "
+                "when it materially helps answer questions about a named account, opportunity, "
+                "pipeline, stage, amount, close date, forecast, owner, or renewal. Otherwise "
+                "answer from transcript evidence without unnecessary Salesforce calls. "
+                "Never invent CRM values. Clearly distinguish Salesforce facts, transcript "
+                "evidence, and inference. Never attempt any write, update, or delete action."
+            )
+            message = anthropic_client.beta.messages.create(
+                model=MODEL_QUERY,
+                max_tokens=4096,
+                system=sf_system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                mcp_servers=[{
+                    "type": "url",
+                    "url": SALESFORCE_MCP_URL,
+                    "name": "salesforce",
+                    "authorization_token": sf_access_token,
+                }],
+                tools=[{
+                    "type": "mcp_toolset",
+                    "mcp_server_name": "salesforce",
+                    "default_config": {"enabled": False},
+                    "configs": {
+                        "getObjectSchema": {"enabled": True},
+                        "soqlQuery": {"enabled": True},
+                    },
+                }],
+                betas=["mcp-client-2025-11-20"],
+            )
+        except Exception as sf_exc:
+            salesforce_status = "unavailable"
+            print("Salesforce enrichment failed:", type(sf_exc).__name__, str(sf_exc), flush=True)
+            message = anthropic_client.messages.create(
+                model=MODEL_QUERY,
+                max_tokens=4096,
+                system=QUERY_SYSTEM_PROMPT,
+                messages=[{
+                    "role": "user",
+                    "content": user_prompt + (
+                        "\n\nSalesforce was unavailable for this request. Answer from "
+                        "transcript evidence only and explicitly say Salesforce could not be checked "
+                        "if the question requires CRM data."
+                    ),
+                }],
+            )
+
+        answer_text = "\n".join(
+            block.text for block in message.content
+            if getattr(block, "type", "") == "text" and getattr(block, "text", None)
+        ).strip() or "No text response was returned."
+
         return jsonify({
-            "answer": message.content[0].text.strip(),
+            "answer": answer_text,
             "records_searched": len(top_rows),
             "debug": {
                 "records_loaded": total_loaded,
                 "records_used": len(top_rows),
+                "salesforce_status": salesforce_status,
                 "distinct_customers_used": distinct_customers,
                 "fields_used": fields,
                 "call_types_used": call_types,
