@@ -1,0 +1,11 @@
+
+# secrets
+.env
+service-account.json
+# local artifacts
+__pycache__/
+*.swp
+*.bak_*
+*_backup.py
+*_backup.txt
+*.pre_*

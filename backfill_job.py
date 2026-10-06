@@ -17,7 +17,8 @@ DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 
 MODEL_EXTRACT = "claude-haiku-4-5-20251001"
 
-SHEET_TAB_INSIGHTS = "Insights"
+SHEET_TAB_INSIGHTS = "Insights_v5"
+SHEET_TAB_ACCOUNT_SUMMARY = "Account_Summary"
 SHEET_TAB_QUOTES = "Quotes"
 SHEET_TAB_LOG = "ProcessingLog"
 
@@ -115,31 +116,77 @@ def download_file_text(drive, file_id):
 
 
 def extract_transcript(transcript_text, source_file):
-    message = anthropic_client.messages.create(
-        model=MODEL_EXTRACT,
-        max_tokens=4096,
-        system=EXTRACTION_SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Here is the full transcript:\n\n{transcript_text}",
-            }
-        ],
+    last_error = None
+
+    for attempt in range(1, 3):
+        retry_note = ""
+        if attempt > 1:
+            retry_note = (
+                "\n\nIMPORTANT: Your previous response could not be parsed. "
+                "Return ONLY complete, valid JSON. Be concise enough to finish "
+                "the entire JSON object. Do not use markdown fences."
+            )
+
+        message = anthropic_client.messages.create(
+            model=MODEL_EXTRACT,
+            max_tokens=8192 if attempt == 1 else 16000,
+            system=EXTRACTION_SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"Here is the full transcript:\n\n{transcript_text}"
+                        f"{retry_note}"
+                    ),
+                }
+            ],
+        )
+
+        raw = "".join(
+            block.text
+            for block in message.content
+            if getattr(block, "type", "") == "text"
+        ).strip()
+
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+
+        if message.stop_reason == "max_tokens":
+            last_error = RuntimeError(
+                f"Claude response truncated at max_tokens on attempt {attempt}"
+            )
+            print(str(last_error))
+            continue
+
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError as e:
+            last_error = e
+            print(
+                f"JSON parse failed on attempt {attempt}/2: "
+                f"{type(e).__name__}: {e}"
+            )
+            continue
+
+        result["_tokens_used"] = (
+            message.usage.input_tokens + message.usage.output_tokens
+        )
+        result["_source_file"] = source_file
+        return result
+
+    raise RuntimeError(
+        f"Claude returned invalid JSON after 2 attempts: {last_error}"
     )
-
-    raw = message.content[0].text.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-
-    result = json.loads(raw)
-    result["_tokens_used"] = message.usage.input_tokens + message.usage.output_tokens
-    result["_source_file"] = source_file
-    return result
-
 
 def arr_to_str(val):
     if isinstance(val, list):
+        # Preserve structured v5 objects as valid JSON in the Sheet.
+        if any(isinstance(v, dict) for v in val):
+            return json.dumps(val, ensure_ascii=False)
         return " | ".join(str(v) for v in val if v)
+
+    if isinstance(val, dict):
+        return json.dumps(val, ensure_ascii=False)
 
     return val if val is not None else ""
 
@@ -151,21 +198,31 @@ def write_to_sheets(sheets, call_id, file_id, extraction):
         call_id,
         extraction.get("call_type", ""),
         extraction.get("confidence", ""),
-        extraction.get("transcript_quality", ""),
         extraction.get("customer_name", ""),
         extraction.get("call_date", ""),
         extraction.get("call_duration_minutes", ""),
         arr_to_str(extraction.get("participants_pivotree", [])),
         arr_to_str(extraction.get("participants_customer", [])),
+        arr_to_str(extraction.get("customer_pain_points", [])),
+        arr_to_str(extraction.get("customer_requests", [])),
+        arr_to_str(extraction.get("buying_signals", [])),
+        arr_to_str(extraction.get("expansion_signals", [])),
+        arr_to_str(extraction.get("missed_opportunities", [])),
         arr_to_str(extraction.get("sales_objections", [])),
-        arr_to_str(extraction.get("service_gaps", [])),
         arr_to_str(extraction.get("proposal_feedback", [])),
         arr_to_str(extraction.get("delivery_risks", [])),
         arr_to_str(extraction.get("churn_signals", [])),
-        arr_to_str(extraction.get("competitor_mentions", [])),
+        arr_to_str(extraction.get("pivotree_improvement_opportunities", [])),
+        arr_to_str(extraction.get("partner_mentions", [])),
+        arr_to_str(extraction.get("competitive_mentions", [])),
+        arr_to_str(extraction.get("ai_mentions", [])),
         extraction.get("_source_file", ""),
         now,
-        extraction.get("schema_version", "v4"),
+        extraction.get("schema_version", "v5"),
+        extraction.get("customer_sentiment", "unclear"),
+        extraction.get("sentiment_score", ""),
+        extraction.get("sentiment_reason", ""),
+        extraction.get("sentiment_evidence", ""),
     ]]
 
     sheets.spreadsheets().values().append(
@@ -213,6 +270,129 @@ def write_to_sheets(sheets, call_id, file_id, extraction):
             file_id,
         ]]},
     ).execute()
+
+
+
+def refresh_account_summary(sheets):
+    print("Refreshing Account_Summary")
+
+    _, rows = read_sheet(sheets, SHEET_TAB_INSIGHTS)
+
+    valid_sentiments = {"positive", "neutral", "negative", "mixed"}
+    accounts = {}
+
+    for idx, row in enumerate(rows):
+        customer_name = str(row.get("customer_name", "")).strip()
+        sentiment = str(row.get("customer_sentiment", "")).strip().lower()
+        raw_score = str(row.get("sentiment_score", "")).strip()
+
+        if not customer_name:
+            continue
+
+        if sentiment not in valid_sentiments:
+            continue
+
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            continue
+
+        accounts.setdefault(customer_name, []).append({
+            "sentiment": sentiment,
+            "score": score,
+            "call_date": str(row.get("call_date", "")).strip(),
+            "processed_at": str(row.get("processed_at", "")).strip(),
+            "row_order": idx,
+        })
+
+    summary_rows = [[
+        "customer_name",
+        "current_sentiment",
+        "average_sentiment_score",
+        "trend_indicator",
+    ]]
+
+    for customer_name in sorted(accounts, key=str.lower):
+        calls = accounts[customer_name]
+
+        # YYYY-MM-DD and ISO processed_at values sort correctly as strings.
+        calls.sort(
+            key=lambda c: (
+                c["call_date"],
+                c["processed_at"],
+                c["row_order"],
+            ),
+            reverse=True,
+        )
+
+        recent = calls[:3]
+
+        # Mode of latest 3. If tied, the most recent call wins.
+        counts = {}
+        for call in recent:
+            sent = call["sentiment"]
+            counts[sent] = counts.get(sent, 0) + 1
+
+        max_count = max(counts.values())
+        tied = {
+            sentiment
+            for sentiment, count in counts.items()
+            if count == max_count
+        }
+
+        current_sentiment = next(
+            call["sentiment"]
+            for call in recent
+            if call["sentiment"] in tied
+        )
+
+        avg_recent = sum(c["score"] for c in recent) / len(recent)
+        avg_recent = round(avg_recent, 2)
+
+        previous = calls[3:6]
+
+        if not previous:
+            trend = "Insufficient History"
+        else:
+            avg_previous = (
+                sum(c["score"] for c in previous) / len(previous)
+            )
+
+            change = avg_recent - avg_previous
+
+            if change >= 0.25:
+                trend = "Improving"
+            elif change <= -0.25:
+                trend = "Declining"
+            else:
+                trend = "Stable"
+
+        summary_rows.append([
+            customer_name,
+            current_sentiment,
+            avg_recent,
+            trend,
+        ])
+
+    # Rebuild the account summary atomically from the source-of-truth rows.
+    sheets.spreadsheets().values().clear(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{SHEET_TAB_ACCOUNT_SUMMARY}!A:D",
+        body={},
+    ).execute()
+
+    sheets.spreadsheets().values().update(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{SHEET_TAB_ACCOUNT_SUMMARY}!A1",
+        valueInputOption="RAW",
+        body={"values": summary_rows},
+    ).execute()
+
+    print(
+        f"Account_Summary refreshed: "
+        f"{len(summary_rows) - 1} accounts"
+    )
+
 
 
 def main():
@@ -286,6 +466,11 @@ def main():
             print(f"ERROR {file_name}: {str(e)}")
 
         time.sleep(SLEEP_SECONDS)
+
+    try:
+        refresh_account_summary(sheets)
+    except Exception as e:
+        print(f"ACCOUNT SUMMARY ERROR: {str(e)}")
 
     print(f"Done. Success={success}, Errors={errors}, Skipped={skipped}")
 
