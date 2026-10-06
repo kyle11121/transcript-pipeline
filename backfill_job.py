@@ -275,6 +275,17 @@ def write_to_sheets(sheets, call_id, file_id, extraction):
 
 def refresh_account_summary(sheets):
     print("Refreshing Account_Summary")
+    alias_map = {}
+    try:
+        _, alias_rows = read_sheet(sheets, "Account_Aliases")
+        for a in alias_rows:
+            k = str(a.get("alias", "")).strip().lower()
+            v = str(a.get("canonical_name", "")).strip()
+            if k and v:
+                alias_map[k] = v
+        print(f"Loaded {len(alias_map)} account aliases")
+    except Exception as e:
+        print(f"ALIAS LOAD WARNING: {e}")
 
     _, rows = read_sheet(sheets, SHEET_TAB_INSIGHTS)
 
@@ -283,6 +294,7 @@ def refresh_account_summary(sheets):
 
     for idx, row in enumerate(rows):
         customer_name = str(row.get("customer_name", "")).strip()
+        customer_name = alias_map.get(customer_name.lower(), customer_name)
         sentiment = str(row.get("customer_sentiment", "")).strip().lower()
         raw_score = str(row.get("sentiment_score", "")).strip()
 
