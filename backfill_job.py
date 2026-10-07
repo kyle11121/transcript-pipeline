@@ -407,6 +407,85 @@ def refresh_account_summary(sheets):
 
 
 
+def refresh_sentiment_timeline(sheets):
+    try:
+        import datetime as _dt
+        tab = "Sentiment_Timeline"
+        print("Refreshing Sentiment_Timeline")
+
+        alias_map = {}
+        try:
+            _, alias_rows = read_sheet(sheets, "Account_Aliases")
+            for a in alias_rows:
+                k = str(a.get("alias", "")).strip().lower()
+                v = str(a.get("canonical_name", "")).strip()
+                if k and v:
+                    alias_map[k] = v
+        except Exception as e:
+            print(f"TIMELINE ALIAS WARNING: {e}")
+
+        today = _dt.date.today()
+        months = []
+        y, m = today.year, today.month
+        for _ in range(6):
+            months.append(f"{y:04d}-{m:02d}")
+            m -= 1
+            if m == 0:
+                y, m = y - 1, 12
+        months.reverse()
+        month_set = set(months)
+
+        _, rows = read_sheet(sheets, SHEET_TAB_INSIGHTS)
+        valid = {"positive", "neutral", "negative", "mixed"}
+        acc = {}
+        for row in rows:
+            name = str(row.get("customer_name", "")).strip()
+            sent = str(row.get("customer_sentiment", "")).strip().lower()
+            month = str(row.get("call_date", "")).strip()[:7]
+            if not name or sent not in valid or month not in month_set:
+                continue
+            try:
+                score = float(str(row.get("sentiment_score", "")).strip())
+            except (TypeError, ValueError):
+                continue
+            name = alias_map.get(name.lower(), name)
+            acc.setdefault(name, {}).setdefault(month, []).append(score)
+
+        header = ["customer_name"] + months + [
+            "calls_6mo", "avg_6mo", "first_3mo_avg", "last_3mo_avg", "change", "trend"]
+        out = [header]
+        for name in sorted(acc, key=str.lower):
+            d = acc[name]
+            cells = [round(sum(d[mo]) / len(d[mo]), 2) if mo in d else "" for mo in months]
+            allv = [s for mo in months for s in d.get(mo, [])]
+            first = [s for mo in months[:3] for s in d.get(mo, [])]
+            last = [s for mo in months[3:] for s in d.get(mo, [])]
+            fa = round(sum(first) / len(first), 2) if first else ""
+            la = round(sum(last) / len(last), 2) if last else ""
+            if first and last:
+                ch = round(la - fa, 2)
+                tr = "Improving" if ch >= 0.25 else ("Declining" if ch <= -0.25 else "Stable")
+            else:
+                ch, tr = "", "Insufficient History"
+            out.append([name] + cells + [len(allv), round(sum(allv) / len(allv), 2), fa, la, ch, tr])
+
+        meta = sheets.spreadsheets().get(
+            spreadsheetId=GOOGLE_SHEET_ID, fields="sheets.properties.title").execute()
+        if tab not in [s["properties"]["title"] for s in meta["sheets"]]:
+            sheets.spreadsheets().batchUpdate(
+                spreadsheetId=GOOGLE_SHEET_ID,
+                body={"requests": [{"addSheet": {"properties": {"title": tab}}}]}).execute()
+        sheets.spreadsheets().values().clear(
+            spreadsheetId=GOOGLE_SHEET_ID, range=f"{tab}!A:Z", body={}).execute()
+        sheets.spreadsheets().values().update(
+            spreadsheetId=GOOGLE_SHEET_ID, range=f"{tab}!A1",
+            valueInputOption="RAW", body={"values": out}).execute()
+        print(f"Sentiment_Timeline refreshed: {len(out) - 1} accounts, {months[0]} to {months[-1]}")
+    except Exception as e:
+        print(f"SENTIMENT TIMELINE ERROR: {e}")
+
+
+
 def main():
     print("Starting Cloud Run transcript job")
 
@@ -481,6 +560,7 @@ def main():
 
     try:
         refresh_account_summary(sheets)
+        refresh_sentiment_timeline(sheets)
     except Exception as e:
         print(f"ACCOUNT SUMMARY ERROR: {str(e)}")
 
